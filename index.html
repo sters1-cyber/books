@@ -280,6 +280,14 @@
   .cm-del { background: none; border: none; color: #ef4444; font-size: 12px; font-family: inherit; cursor: pointer; }
   .cm-form { margin-top: 14px; display: flex; flex-direction: column; gap: 10px; }
   .cm-form .field { min-height: 90px; }
+  .fix-panel { margin-bottom: 10px; }
+  .fix-row { background: var(--bg); border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px; margin-bottom: 8px; font-size: 14px; line-height: 1.45; }
+  .fix-ctx { color: var(--muted); word-wrap: break-word; }
+  .fix-ctx mark { background: rgba(239,68,68,.25); color: var(--text); border-radius: 3px; padding: 0 2px; }
+  .fix-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; align-items: center; }
+  .fix-actions .chip { font-size: 14px; padding: 6px 12px; }
+  .fix-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; font-size: 14px; }
+  .fix-ok { color: #16a34a; }
   .res-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px 10px; }
   .res-card { background: none; border: none; font-family: inherit; color: var(--text); cursor: pointer; text-align: center; padding: 0 0 10px; }
   .res-card .rt { font-size: 14px; font-weight: 600; margin-top: 2px; }
@@ -925,11 +933,12 @@
     const b = allBooks().find(x => x.id === id);
     if (!b || b.owner !== (store.get('session') || '').toLowerCase()) return;
     editingId = id;
+    fixes = {};
     const box = document.getElementById('editBook');
     box.innerHTML = '';
     const st = mkEl('div', 'stack');
 
-    st.append(mkEl('div', 'req-note', 'Можно только дописывать. Написанный ранее текст, название книги, названия глав и жанры изменить нельзя.'));
+    st.append(mkEl('div', 'req-note', 'Можно только дописывать. Написанный ранее текст, название книги, названия глав и жанры изменить нельзя. Исключение: кнопка «Проверить ошибки» сама находит опечатки и пропущенные знаки препинания, а вам остаётся выбрать из предложенных исправлений. Для проверки текст главы отправляется в сервис LanguageTool.'));
     st.append(mkEl('div', 'label-s', 'Название книги (нельзя менять)'), mkEl('div', 'locked t', b.title));
     st.append(mkEl('div', 'label-s', 'Автор'), mkEl('div', 'locked', b.author));
     st.append(mkEl('div', 'label-s', 'Жанр (нельзя менять)'));
@@ -940,12 +949,14 @@
     st.append(mkEl('div', 'label-s', 'Главы'));
     b.chapters.forEach((c, i) => {
       const card = mkEl('div', 'chap');
-      card.append(mkEl('div', 'chap-head', 'ГЛАВА ' + (i + 1)));
-      card.append(mkEl('div', 'locked t', c.title));
-      card.append(mkEl('div', 'locked old', c.text));
+      const titleEl = mkEl('div', 'locked t', c.title);
+      const textEl = mkEl('div', 'locked old', c.text);
+      const chk = mkEl('button', 'btn secondary sm', 'Проверить ошибки');
+      const panel = mkEl('div', 'fix-panel');
+      chk.addEventListener('click', () => runCheck(i, c, chk, panel, titleEl, textEl));
       const ta = mkEl('textarea', 'field add'); ta.placeholder = 'Дописать к этой главе';
       ta.style.minHeight = '90px';
-      card.append(ta);
+      card.append(mkEl('div', 'chap-head', 'ГЛАВА ' + (i + 1)), titleEl, textEl, chk, panel, ta);
       st.append(card);
     });
 
@@ -994,13 +1005,17 @@
       title: c.querySelector('.ct').value.trim(), text: c.querySelector('.tx').value.trim()
     }));
     if (news.some(c => !c.title || !c.text)) { err.textContent = 'У новой главы должны быть название и текст'; return; }
-    if (!adds.some(a => a) && !news.length) { err.textContent = 'Вы ничего не добавили'; return; }
+    const fixCount = Object.values(fixes).reduce((n, f) => n + f.items.filter(it => it.chosen).length, 0);
+    if (!adds.some(a => a) && !news.length && !fixCount) { err.textContent = 'Вы ничего не добавили'; return; }
 
     // старые название и текст берутся из сохранённой книги, меняется только дописанное
-    const chapters = b.chapters.map((c, i) => ({
-      title: c.title,
-      text: adds[i] ? c.text + '\n\n' + adds[i] : c.text
-    })).concat(news);
+    // исправления применяются к сохранённому тексту и только из списка безопасных правок
+    const chapters = b.chapters.map((c, i) => {
+      const f = fixes[i];
+      const title = f ? applyFixes(c.title, f.items, 'title') : c.title;
+      const body = f ? applyFixes(c.text, f.items, 'text') : c.text;
+      return { title, text: adds[i] ? body + '\n\n' + adds[i] : body };
+    }).concat(news);
     books[idx] = { ...b, chapters };
     store.set('books', JSON.stringify(books));
     openTab('profile');
@@ -1097,6 +1112,160 @@
     }
     draw();
     return sec;
+  }
+
+  // ---------- Автоисправление ошибок (LanguageTool) ----------
+  // Автор не вводит текст сам: он может только принять предложенную правку.
+  // Допускаются лишь знаки препинания, пробелы, регистр и небольшие правки одного слова.
+  var fixes = {};
+
+  function levenshtein(a, b) {
+    const m = a.length, n = b.length;
+    let prev = Array.from({ length: n + 1 }, (_, j) => j);
+    for (let i = 1; i <= m; i++) {
+      const cur = [i];
+      for (let j = 1; j <= n; j++) {
+        cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      }
+      prev = cur;
+    }
+    return prev[n];
+  }
+  function onlyLetters(x) { return x.toLowerCase().replace(/ё/g, 'е').replace(/[^a-zа-я0-9]/g, ''); }
+  function endMarks(x) { return (x.match(/[.!?…]+/g) || []).join('|'); }
+
+  function safeFix(orig, repl) {
+    if (typeof repl !== 'string' || !repl || repl === orig) return false;
+    if (endMarks(orig) && endMarks(orig) !== endMarks(repl)) return false;   // . ! ? не подменяем
+    const a = onlyLetters(orig), b = onlyLetters(repl);
+    if (a === b) return true;                                  // только знаки, пробелы, регистр
+    if (/\s/.test(orig.trim()) || /\s/.test(repl.trim())) return false;   // перефразирование нельзя
+    if (a.length < 3) return false;
+    const max = Math.min(2, Math.max(1, Math.floor(a.length / 3)));
+    return levenshtein(a, b) <= max;                           // опечатка в слове
+  }
+
+  function applyFixes(str, items, field) {
+    const list = items.filter(it => it.field === field && it.chosen && safeFix(it.orig, it.chosen)
+      && str.substr(it.offset, it.length) === it.orig).sort((x, y) => y.offset - x.offset);
+    let out = str;
+    list.forEach(it => { out = out.slice(0, it.offset) + it.chosen + out.slice(it.offset + it.length); });
+    return out;
+  }
+
+  function splitChunks(text, max) {
+    const out = []; let start = 0;
+    while (start < text.length) {
+      let end = Math.min(start + max, text.length);
+      if (end < text.length) {
+        let cut = text.lastIndexOf('\n', end);
+        if (cut <= start) cut = text.lastIndexOf(' ', end);
+        if (cut > start) end = cut + 1;
+      }
+      out.push({ start: start, text: text.slice(start, end) });
+      start = end;
+    }
+    return out;
+  }
+
+  async function ltCheck(text) {
+    const res = await fetch('https://api.languagetool.org/v2/check', {
+      method: 'POST', body: new URLSearchParams({ text: text, language: 'ru-RU' })
+    });
+    if (!res.ok) throw new Error('status ' + res.status);
+    const j = await res.json();
+    return j.matches || [];
+  }
+
+  async function runCheck(i, c, btn, panel, titleEl, textEl) {
+    btn.disabled = true;
+    const label = btn.textContent; btn.textContent = 'Проверяем…';
+    panel.innerHTML = '';
+    try {
+      const items = [];
+      const chunks = splitChunks(c.text, 14000);
+      if (!chunks.length) chunks.push({ start: 0, text: '' });
+      for (let k = 0; k < chunks.length; k++) {
+        const ch = chunks[k];
+        const shift = k === 0 ? c.title.length + 2 : 0;
+        const payload = k === 0 ? c.title + '\n\n' + ch.text : ch.text;
+        const matches = await ltCheck(payload);
+        matches.forEach(m => {
+          if (!m.length) return;
+          const orig = payload.substr(m.offset, m.length);
+          let field, off, src;
+          if (k === 0 && m.offset + m.length <= c.title.length) { field = 'title'; off = m.offset; src = c.title; }
+          else if (m.offset >= shift) { field = 'text'; off = ch.start + m.offset - shift; src = c.text; }
+          else return;
+          if (src.substr(off, m.length) !== orig) return;
+          const options = (m.replacements || []).map(r => r.value).filter(v => safeFix(orig, v)).slice(0, 3);
+          if (!options.length) return;
+          items.push({ field: field, offset: off, length: m.length, orig: orig, options: options, chosen: null, skipped: false });
+        });
+      }
+      // без пересечений
+      items.sort((x, y) => (x.field === y.field ? x.offset - y.offset : x.field < y.field ? -1 : 1));
+      const clean = [];
+      items.forEach(it => {
+        const last = clean[clean.length - 1];
+        if (last && last.field === it.field && it.offset < last.offset + last.length) return;
+        clean.push(it);
+      });
+      fixes[i] = { items: clean };
+      renderFixPanel(i, c, panel, titleEl, textEl);
+    } catch (e) {
+      panel.append(mkEl('div', 'auth-error', 'Не удалось связаться со службой проверки. Попробуйте позже.'));
+    } finally {
+      btn.disabled = false; btn.textContent = label;
+    }
+  }
+
+  function renderFixPanel(i, c, panel, titleEl, textEl) {
+    const f = fixes[i];
+    panel.innerHTML = '';
+    const pending = f.items.filter(it => !it.skipped);
+    if (!pending.length) { panel.append(mkEl('div', 'fix-ok', 'Ошибок не найдено ✓')); }
+    else {
+      const head = mkEl('div', 'fix-head');
+      head.append(mkEl('span', '', 'Найдено исправлений: ' + pending.length));
+      const todo = pending.filter(it => !it.chosen);
+      if (todo.length) {
+        const all = mkEl('button', 'chip on', 'Исправить всё');
+        all.addEventListener('click', () => { todo.forEach(it => { it.chosen = it.options[0]; }); refresh(); });
+        head.append(all);
+      }
+      panel.append(head);
+      pending.forEach(it => {
+        const src = it.field === 'title' ? c.title : c.text;
+        const row = mkEl('div', 'fix-row');
+        const ctx = mkEl('div', 'fix-ctx');
+        const before = src.slice(Math.max(0, it.offset - 30), it.offset).replace(/\s+/g, ' ');
+        const after = src.slice(it.offset + it.length, it.offset + it.length + 30).replace(/\s+/g, ' ');
+        ctx.append(document.createTextNode('…' + before), mkEl('mark', '', it.orig.replace(/\s+/g, ' ')), document.createTextNode(after + '…'));
+        row.append(ctx);
+        const act = mkEl('div', 'fix-actions');
+        if (it.chosen) {
+          act.append(mkEl('span', 'fix-ok', '✓ Исправлено на «' + it.chosen.replace(/\s+/g, ' ') + '»'));
+          const undo = mkEl('button', 'chip', 'Отменить');
+          undo.addEventListener('click', () => { it.chosen = null; refresh(); });
+          act.append(undo);
+        } else {
+          it.options.forEach(o => {
+            const b = mkEl('button', 'chip on', '→ ' + o.replace(/\s+/g, ' '));
+            b.addEventListener('click', () => { it.chosen = o; refresh(); });
+            act.append(b);
+          });
+          const skip = mkEl('button', 'chip', 'Пропустить');
+          skip.addEventListener('click', () => { it.skipped = true; refresh(); });
+          act.append(skip);
+        }
+        row.append(act);
+        panel.append(row);
+      });
+    }
+    titleEl.textContent = applyFixes(c.title, f.items, 'title');
+    textEl.textContent = applyFixes(c.text, f.items, 'text');
+    function refresh() { renderFixPanel(i, c, panel, titleEl, textEl); }
   }
 </script>
 </body>
